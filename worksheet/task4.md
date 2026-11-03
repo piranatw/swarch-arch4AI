@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** Piranat Wadlom
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6732031621
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** A (Owner alerts)
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,9 +58,9 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Latency | The owner gets an alert for a negative review within 2 s (measured p95 of 557 ms at threshold 0.6, run t2-0.6) |
+| 2 | Accuracy / trust | Accuracy of at least 90% (QR3); a wrong alert is worse than a missed one, so no alert is sent for a review without a label |
+| 3 | Capacity and cost | At the peak of 40 reviews per second, at most 20 large-model calls per second (QR5), and as few large calls as possible (QR4) |
 
 ## 2. Design / การออกแบบ
 
@@ -70,14 +70,26 @@ Your topology, the patterns you add, and a container-level diagram (C4 level 2).
 
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
-    Person(customer, "Customer", "Writes restaurant reviews")
+    title CampusEats scenario A: hybrid cascade with cache, owner alerts
+    Person(customer, "Customer", "Posts restaurant reviews")
+    Person(owner, "Restaurant owner", "Receives alerts for negative reviews")
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container(gateway, "API gateway", "Python, FastAPI", "Single entry point for clients")
+        Container(review, "Review service", "Python, FastAPI", "Runs cache, small model and cascade locally; calls the large model with a 1 s timeout; marks the review pending on timeout or error")
+        ContainerDb(store, "Review and label store", "In-memory store", "Saved reviews with label or pending status")
+        Container(retry, "Retry worker", "Python", "Re-scores pending reviews later when the large model is healthy (T4 style)")
+        Container(alert, "Alert service", "Python, FastAPI", "Sends a push notification only for reviews labelled negative")
+        Container(large, "Large model service", "Python, FastAPI, scikit-learn", "Remote large model, at most 20 calls per second")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    Rel(customer, gateway, "Posts review", "HTTP/JSON")
+    Rel(gateway, review, "Forwards request", "HTTP/JSON")
+    Rel(review, large, "Asks only when the small model is unsure (confidence below 0.6)", "REST, 1 s timeout")
+    Rel(review, store, "Saves review and label, or pending", "")
+    Rel(retry, store, "Reads pending reviews, writes labels", "")
+    Rel(retry, large, "Re-scores pending reviews", "REST")
+    Rel(store, alert, "Newly labelled negative reviews", "")
+    Rel(alert, owner, "Push notification within 2 s", "Push")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +100,17 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t2-0.6 | Cascade at threshold 0.6: accuracy 91.5% (meets QR3), p95 557 ms (within the 2 s alert limit), and only 38% of reviews reach the large model |
+| t2-0.7 | At threshold 0.7, 53% of reviews reach the large model, which is too many for the 20 calls per second limit at the peak |
+| t3-cache | Cascade at 0.7 with the cache on: cache hits 35%, and large calls drop to 38% (from 53% in t2-0.7) |
+| t1-before, t1-after | Fallback: with 10% of large calls hanging, errors went from 19 to 0 and 25 reviews became pending instead of failing |
+
+Capacity arithmetic at the peak of 40 reviews per second (the large model handles at most 20 calls per second):
+
+- Calling the large model for every review (T1, run t0-large with 100% large calls): 40 x 1.00 = 40 calls per second, twice the limit.
+- Cascade at 0.6 (t2-0.6, 38%): 40 x 0.38 = 15.2 calls per second, within the limit.
+- Cascade at 0.7 (t2-0.7, 53%): 40 x 0.53 = 21.2 calls per second, over the limit.
+- Cascade at 0.7 with the cache (t3-cache, 38%): 40 x 0.38 = 15.2 calls per second, within the limit. The cache hit rate of 35% was measured on the load-test reviews, so the real rate may differ.
 
 ## 4. ADR
 
@@ -97,20 +118,20 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** Hybrid cascade with cache for owner alerts
 
 **Status:** Proposed
 
-**Context:**
+**Context:** Owners must get an alert for a negative review within 2 s, and at the lunch peak 40 reviews arrive per second, but the large model handles at most 20 calls per second and every call costs money. Wrong alerts make owners stop trusting alerts.
 
-**Decision:**
+**Decision:** Use T3 (hybrid): the small model runs locally in the review service, with a cascade at threshold 0.6, a prediction cache, and a 1 s timeout with fallback to pending. The small model answers fast and does not use up the large model's quota; the large model is called only for the roughly 38% of reviews the small model is unsure about, about 15 calls per second at the peak (run t2-0.6). An alert is sent only for reviews that have a negative label, never for pending ones.
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: Large-model load stays under the 20 calls per second limit (15.2 at the peak), p95 is 557 ms (within the 2 s alert limit), and a hanging large model no longer breaks posting (errors 19 to 0 in t1-after).
+- Negative: The small model can be confidently wrong (for example "The pad thai looked cold but it tasted excellent." gets negative at 0.68), which causes some false alerts, and accuracy of 91.5% is only 1.5 points above the 90% limit. Pending reviews get no alert until they are re-scored.
 
 **Alternatives considered:** at least one topology you rejected, and why.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
 
->
+> T1 (model as a service, called for every review) was rejected. It needs 40 large-model calls per second at the peak, twice the 20 per second limit, and if the large model goes down, alerts stop completely.
